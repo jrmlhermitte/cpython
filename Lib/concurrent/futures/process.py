@@ -41,6 +41,12 @@ Local worker thread:
 Process #1..n:
 - reads _CallItems from "Call Q", executes the calls, and puts the resulting
   _ResultItems in "Result Q"
+
+
+NOTE (jrmlhermitte): This process pool executor was modified after the fact to allow
+for delaying the running of futures until they are actually processed by the
+processing worker. Previously, more work than the number of processes was enqueued
+and marked as processing.
 """
 
 __author__ = 'Brian Quinlan (brian@sweetapp.com)'
@@ -208,7 +214,8 @@ def _sendback_result(result_queue, work_id, result=None, exception=None):
         result_queue.put(_ResultItem(work_id, exception=exc))
 
 
-def _process_worker(call_queue, result_queue, initializer, initargs):
+def _process_worker(call_queue, result_queue, initializer, initargs,
+                    free_process_semaphore: mp.Semaphore):
     """Evaluates calls from call_queue and places the results in result_queue.
 
     This worker is run in a separate process.
@@ -230,28 +237,31 @@ def _process_worker(call_queue, result_queue, initializer, initargs):
             # mark the pool broken
             return
     while True:
-        call_item = call_queue.get(block=True)
-        if call_item is None:
-            # Wake up queue management thread
-            result_queue.put(os.getpid())
-            return
-        try:
-            r = call_item.fn(*call_item.args, **call_item.kwargs)
-        except BaseException as e:
-            exc = _ExceptionWithTraceback(e, e.__traceback__)
-            _sendback_result(result_queue, call_item.work_id, exception=exc)
-        else:
-            _sendback_result(result_queue, call_item.work_id, result=r)
+        with free_process_semaphore:
+            call_item = call_queue.get(block=True)
+            if call_item is None:
+                # Wake up queue management thread
+                result_queue.put(os.getpid())
+                return
+            try:
+                r = call_item.fn(*call_item.args, **call_item.kwargs)
+            except BaseException as e:
+                exc = _ExceptionWithTraceback(e, e.__traceback__)
+                _sendback_result(result_queue, call_item.work_id, exception=exc)
+            else:
+                _sendback_result(result_queue, call_item.work_id, result=r)
 
-        # Liberate the resource as soon as possible, to avoid holding onto
-        # open files or shared memory that is not needed anymore
-        del call_item
+            # Liberate the resource as soon as possible, to avoid holding onto
+            # open files or shared memory that is not needed anymore
+            del call_item
 
 
 def _add_call_item_to_queue(pending_work_items,
                             work_ids,
-                            call_queue):
-    """Fills call_queue with _WorkItems from pending_work_items.
+                            call_queue,
+                            free_process_semaphore: mp.Semaphore):
+    """Fills call_queue with _WorkItems from pending_work_items, if a process is
+    ready to receive work.
 
     This function never blocks.
 
@@ -266,6 +276,8 @@ def _add_call_item_to_queue(pending_work_items,
             derived from _WorkItems.
     """
     while True:
+        if not _at_least_one_process_ready(free_process_semaphore):
+            return
         if call_queue.full():
             return
         try:
@@ -286,13 +298,25 @@ def _add_call_item_to_queue(pending_work_items,
                 continue
 
 
+def _at_least_one_process_ready(free_process_semaphore: mp.Semaphore):
+    semaphore_acquired = False
+    try:
+        semaphore_acquired = free_process_semaphore.acquire(block=False)
+        return semaphore_acquired
+    finally:
+        if semaphore_acquired:
+            free_process_semaphore.release()
+
+
 def _queue_management_worker(executor_reference,
                              processes,
                              pending_work_items,
                              work_ids_queue,
                              call_queue,
                              result_queue,
-                             thread_wakeup):
+                             thread_wakeup,
+                             free_process_semaphore,
+                             ):
     """Manages the communication between this process and the worker processes.
 
     This function is run in a local thread.
@@ -350,7 +374,8 @@ def _queue_management_worker(executor_reference,
     while True:
         _add_call_item_to_queue(pending_work_items,
                                 work_ids_queue,
-                                call_queue)
+                                call_queue,
+                                free_process_semaphore)
 
         # Wait for a result to be ready in the result_queue while checking
         # that all worker processes are still running, or for a wake up
@@ -527,6 +552,7 @@ class ProcessPoolExecutor(_base.Executor):
         if mp_context is None:
             mp_context = mp.get_context()
         self._mp_context = mp_context
+        self._free_process_semaphore = mp_context.Semaphore()
 
         if initializer is not None and not callable(initializer):
             raise TypeError("initializer must be a callable")
@@ -589,7 +615,9 @@ class ProcessPoolExecutor(_base.Executor):
                       self._work_ids,
                       self._call_queue,
                       self._result_queue,
-                      self._queue_management_thread_wakeup),
+                      self._queue_management_thread_wakeup,
+                      self._free_process_semaphore,
+                      ),
                 name="QueueManagerThread")
             self._queue_management_thread.daemon = True
             self._queue_management_thread.start()
@@ -603,7 +631,9 @@ class ProcessPoolExecutor(_base.Executor):
                 args=(self._call_queue,
                       self._result_queue,
                       self._initializer,
-                      self._initargs))
+                      self._initargs,
+                      self._free_process_semaphore,
+                      ))
             p.start()
             self._processes[p.pid] = p
 
